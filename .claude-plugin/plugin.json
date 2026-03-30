@@ -1,0 +1,12 @@
+{
+  "name": "deploy-guard",
+  "version": "1.0.0",
+  "description": "Deploy safety - smoke tests, perf regression detection, test gates, deploy workflow, CI scaffolding",
+  "author": {
+    "name": "Matt Hesketh",
+    "email": "matt@heskethwebdesign.co.uk"
+  },
+  "repository": "https://github.com/wrxck/deploy-guard",
+  "license": "MIT",
+  "keywords": ["deploy", "smoke-test", "performance", "ci", "testing", "gate", "health-check"]
+}
