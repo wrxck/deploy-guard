@@ -1,5 +1,7 @@
 # deploy-guard
 
+[![CI](https://github.com/wrxck/deploy-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/wrxck/deploy-guard/actions/workflows/ci.yml)
+
 Deploy safety enforcement for Claude Code sessions.
 
 ## What it checks
