@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Claude Code PostToolUse hook for Bash commands.
+Claude Code PostToolUse hook (advisory).
 After a deploy command completes, runs HTTP smoke tests against
-the deployed service to verify it responds within acceptable latency.
+configured endpoints. Config file: ~/.claude/hooks/deploy_endpoints.json
+Expected shape:
+  {
+    "defaults": {"timeout": 5, "max_response_time": 2.0},
+    "<service_name>": {"url": "https://host/health", "timeout": 5}
+  }
+URLs must be http or https; other schemes (file://, etc.) are rejected.
+If the deployed service is not configured, this hook exits silently.
 """
 
 import json
@@ -10,65 +17,76 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 
 ENDPOINTS_FILE = os.path.expanduser('~/.claude/hooks/deploy_endpoints.json')
 
-# patterns that indicate a deploy just happened
 DEPLOY_PATTERNS = [
-    r'\bsystemctl\s+(start|restart)\b',
-    r'\bdocker\s+compose\s+up\b',
-    r'\bdocker\s+restart\b',
-    r'\bcp\s+.*\s+/usr/local/bin/',
+    r'\bsystemctl\s+(?:start|restart|reload|enable\s+--now)\b',
+    r'\b(?:docker|podman)\s+compose\s+up\b',
+    r'\b(?:docker|podman)\s+(?:restart|start|run)\b',
+    r'\b(?:docker|podman)\s+stack\s+deploy\b',
+    r'\bdocker-compose\s+up\b',
+    r'\bkubectl\s+(?:apply|rollout\s+restart|set\s+image)\b',
+    r'\b(?:cp|install|mv)\s+[^\n;&|]*\s+/usr/local/bin/(?:\S+)?',
+    r'\bfleet\s+deploy\b',
+    r'\bservice\s+\S+\s+(?:restart|start|reload)\b',
 ]
+
+DEPLOY_RE = re.compile('|'.join(DEPLOY_PATTERNS))
 
 
 def is_deploy_command(command: str) -> bool:
-    """check if the command is a deploy-related action"""
-    return any(re.search(p, command) for p in DEPLOY_PATTERNS)
+    return bool(DEPLOY_RE.search(command))
 
 
 def load_endpoints() -> dict:
-    """load endpoint configuration from json file"""
     try:
         with open(ENDPOINTS_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 
-def extract_service_name(command: str) -> str | None:
-    """try to extract a service/container name from the deploy command"""
-    # systemctl start/restart <service>
-    m = re.search(r'\bsystemctl\s+(?:start|restart)\s+(\S+)', command)
+def extract_service_name(command: str):
+    m = re.search(r'\bsystemctl\s+(?:start|restart|reload|enable\s+--now)\s+(\S+)', command)
+    if m:
+        name = m.group(1)
+        if name.endswith('.service'):
+            name = name[:-len('.service')]
+        return name
+    m = re.search(r'\b(?:docker|podman)\s+(?:restart|start)\s+(\S+)', command)
     if m:
         return m.group(1)
-
-    # docker restart <container>
-    m = re.search(r'\bdocker\s+restart\s+(\S+)', command)
+    m = re.search(r'\bservice\s+(\S+)\s+(?:restart|start|reload)', command)
     if m:
         return m.group(1)
-
-    # cp <binary> /usr/local/bin/<name>
-    m = re.search(r'\bcp\s+\S+\s+/usr/local/bin/(\S+)', command)
+    m = re.search(r'\b(?:cp|install|mv)\s+\S+\s+/usr/local/bin/(\S+)', command)
     if m:
         return m.group(1)
-
-    # docker compose up (use directory name as hint)
-    if re.search(r'\bdocker\s+compose\s+up\b', command):
-        return None  # could be multiple services
-
+    m = re.search(r'\bfleet\s+deploy\s+(\S+)', command)
+    if m:
+        return m.group(1)
     return None
 
 
+def safe_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+
+
 def run_smoke_test(url: str, timeout: int = 5) -> dict:
-    """run a curl smoke test against a url, returns status and timing"""
     try:
         result = subprocess.run(
             [
                 'curl', '-sS', '-o', '/dev/null',
                 '-w', '%{http_code}|%{time_total}',
                 '--max-time', str(timeout),
+                '--proto', '=http,https',
                 url,
             ],
             capture_output=True,
@@ -98,37 +116,45 @@ def run_smoke_test(url: str, timeout: int = 5) -> dict:
         }
 
 
+def emit_context(context: str):
+    output = {
+        'hookSpecificOutput': {
+            'hookEventName': 'PostToolUse',
+            'additionalContext': context,
+        }
+    }
+    print(json.dumps(output))
+
+
 def main():
     try:
         input_data = json.load(sys.stdin)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         sys.exit(0)
 
-    tool_input = input_data.get('tool_input', {})
-    command = tool_input.get('command', '')
+    tool_input = input_data.get('tool_input', {}) or {}
+    command = tool_input.get('command', '') or ''
 
     if not command or not is_deploy_command(command):
         sys.exit(0)
 
     config = load_endpoints()
-    defaults = config.get('defaults', {})
+    defaults = config.get('defaults', {}) if isinstance(config, dict) else {}
     max_time = defaults.get('max_response_time', 2.0)
     default_timeout = defaults.get('timeout', 5)
 
     service_name = extract_service_name(command)
     endpoints_to_test = []
 
-    if service_name and service_name in config:
-        ep = config[service_name]
-        endpoints_to_test.append(ep)
+    if service_name and isinstance(config.get(service_name), dict):
+        endpoints_to_test.append(config[service_name])
     elif service_name:
-        # no configured endpoint — try common health paths
-        endpoints_to_test.append({
-            'url': f'http://127.0.0.1:8080/health',
-            'timeout': default_timeout,
-        })
+        emit_context(
+            f'no smoke endpoint configured for {service_name}; skipping smoke test. '
+            f'add it to {ENDPOINTS_FILE} to enable.'
+        )
+        sys.exit(0)
     else:
-        # test all configured endpoints (except defaults key)
         for key, ep in config.items():
             if key != 'defaults' and isinstance(ep, dict) and 'url' in ep:
                 endpoints_to_test.append(ep)
@@ -141,7 +167,15 @@ def main():
     for ep in endpoints_to_test:
         url = ep.get('url', '')
         timeout = ep.get('timeout', default_timeout)
-        if not url:
+        if not url or not safe_url(url):
+            results.append({
+                'url': url or '<missing>',
+                'status': 0,
+                'time': 0,
+                'error': 'url rejected: must be http or https',
+                'passed': False,
+            })
+            all_passed = False
             continue
         result = run_smoke_test(url, timeout)
         passed = (
@@ -157,10 +191,9 @@ def main():
     if not results:
         sys.exit(0)
 
-    # build context report
-    lines = [f"deploy smoke test results for: {command[:80]}"]
+    lines = [f'deploy smoke test results for: {command[:80]}']
     for r in results:
-        if r['error']:
+        if r.get('error'):
             lines.append(f"  FAIL {r['url']}: {r['error']}")
         elif not r['passed']:
             reasons = []
@@ -173,17 +206,10 @@ def main():
             lines.append(f"  PASS {r['url']}: HTTP {r['status']} in {r['time']:.2f}s")
 
     if not all_passed:
-        lines.append("")
-        lines.append("WARNING: one or more smoke tests failed — investigate before proceeding")
+        lines.append('')
+        lines.append('WARNING: one or more smoke tests failed — investigate before proceeding')
 
-    context = '\n'.join(lines)
-    output = {
-        'hookSpecificOutput': {
-            'hookEventName': 'PostToolUse',
-            'additionalContext': context,
-        }
-    }
-    print(json.dumps(output))
+    emit_context('\n'.join(lines))
     sys.exit(0)
 
 
