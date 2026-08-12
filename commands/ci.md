@@ -1,3 +1,7 @@
+---
+description: Scaffold a GitHub Actions CI/CD workflow for the current project
+---
+
 # /ci -- Generate CI/CD Workflow
 
 Scaffold a GitHub Actions CI/CD workflow for the current project. Detect the project type and tooling, then generate an appropriate `.github/workflows/ci.yml`.
