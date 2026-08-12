@@ -1,3 +1,7 @@
+---
+description: Standardised deployment workflow that ensures tests pass, builds succeed, and health checks verify the deployment before considering it complete
+---
+
 # /deploy
 
 Standardised deployment workflow that ensures tests pass, builds succeed, and health checks verify the deployment before considering it complete.
